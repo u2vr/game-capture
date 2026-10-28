@@ -4211,18 +4211,28 @@ void MainWindow::refreshSelectedWindowPreview() {
         return;
     }
 
+    if (isLive_ && core_) {
+        const auto frame = core_->getPublisherPreviewFrame();
+        if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
+            QImage img(frame->data.data(), frame->width, frame->height, frame->stride, QImage::Format_ARGB32);
+            QSize targetSize = previewLabel_->contentsRect().size();
+            if (!targetSize.isValid() || targetSize.isEmpty()) {
+                targetSize = previewLabel_->size();
+            }
+            if (!targetSize.isValid() || targetSize.isEmpty()) {
+                targetSize = QSize(420, 220);
+            }
+            previewLabel_->setText(QString());
+            previewLabel_->setPixmap(QPixmap::fromImage(img).scaled(
+                targetSize,
+                Qt::KeepAspectRatio,
+                Qt::SmoothTransformation));
+            return;
+        }
+    }
+
     const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
     if (selectedWindowId_.isEmpty()) {
-        if (isLive_ && core_) {
-            const auto frame = core_->getPublisherPreviewFrame();
-            if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
-                QImage img(frame->data.data(), frame->width, frame->height, frame->stride, QImage::Format_ARGB32);
-                QSize targetSize = previewLabel_->size();
-                if (!targetSize.isValid() || targetSize.isEmpty()) targetSize = QSize(420, 220);
-                previewLabel_->setPixmap(QPixmap::fromImage(img).scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-                return;
-            }
-        }
         previewLabel_->setPixmap(QPixmap());
         previewLabel_->setText(
             sourceMode == "spout"

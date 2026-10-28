@@ -7625,16 +7625,58 @@ void VersusApp::startVideoMaintenanceThread() {
                     case VideoSourceMode::Window:
                     default:
                         sourceCapturing = windowCapture_.isCapturing();
+#ifdef _WIN32
+                        if (!sourceCapturing && live_.load(std::memory_order_relaxed)) {
+                            try {
+                                const auto hwndVal = static_cast<uintptr_t>(std::stoull(lifecycle.selectedWindowId, nullptr, 0));
+                                HWND targetHwnd = reinterpret_cast<HWND>(hwndVal);
+                                if (targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd)) {
+                                    video::EncoderConfig captureConfig;
+                                    {
+                                        std::lock_guard<std::mutex> lock(videoSendMutex_);
+                                        captureConfig = videoConfig_;
+                                    }
+                                    if (windowCapture_.startCapture(
+                                            lifecycle.selectedWindowId,
+                                            captureConfig.width > 0 ? captureConfig.width : 1920,
+                                            captureConfig.height > 0 ? captureConfig.height : 1080,
+                                            captureConfig.frameRate > 0 ? captureConfig.frameRate : 60,
+                                            captureConfig.enableAlpha ||
+                                                captureConfig.alphaBackgroundMode != video::AlphaBackgroundMode::None)) {
+                                        spdlog::info("[App] Restored capture for window {}", lifecycle.selectedWindowId);
+                                        sourceCapturing = true;
+                                        pendingGlobalKeyframe_.store(true, std::memory_order_relaxed);
+                                    }
+                                }
+                            } catch (...) {
+                            }
+                        }
+#endif
                         break;
                 }
             }
             if (wasSourceCapturing && !sourceCapturing) {
-                spdlog::info("[App] Capture source closed or stopped; streaming placeholder");
+                spdlog::info("[App] Capture source closed or stopped");
+                bool keepCachedFrame = false;
+#ifdef _WIN32
+                if (sourceMode == VideoSourceMode::Window && !lifecycle.selectedWindowId.empty()) {
+                    try {
+                        const auto hwndVal = static_cast<uintptr_t>(std::stoull(lifecycle.selectedWindowId, nullptr, 0));
+                        HWND targetHwnd = reinterpret_cast<HWND>(hwndVal);
+                        if (targetHwnd && IsWindow(targetHwnd)) {
+                            keepCachedFrame = true;
+                        }
+                    } catch (...) {
+                    }
+                }
+#endif
                 {
                     std::lock_guard<std::mutex> notifyLock(encodeNotifyMutex_);
                     std::lock_guard<std::mutex> frameLock(latestVideoFrameMutex_);
                     pendingVideoFrames_.clear();
-                    cachedVideoFrame_.reset();
+                    if (!keepCachedFrame) {
+                        cachedVideoFrame_.reset();
+                    }
                 }
                 pendingGlobalKeyframe_.store(true, std::memory_order_relaxed);
             }
@@ -8052,7 +8094,9 @@ void VersusApp::startEncodeThread() {
                 // consumed image must not suppress the next fresh-frame wait.
                 std::lock_guard<std::mutex> frameLock(latestVideoFrameMutex_);
                 if (!isSourceCapturing()) {
-                    frame = getPlaceholderFrame(videoState.config.width, videoState.config.height);
+                    frame = (cachedVideoFrame_ && !cachedVideoFrame_->data.empty())
+                        ? cachedVideoFrame_
+                        : getPlaceholderFrame(videoState.config.width, videoState.config.height);
                 } else if (pendingVideoFrames_.empty()) {
                     frame = cachedVideoFrame_;
                 } else {

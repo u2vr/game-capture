@@ -264,6 +264,35 @@ struct ThumbnailPixels {
     std::vector<uint8_t> pixels;
 };
 
+bool isUwpWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    wchar_t name[256] = {};
+    if (!GetClassNameW(hwnd, name, static_cast<int>(std::size(name)))) {
+        return false;
+    }
+    return wcscmp(name, L"ApplicationFrameWindow") == 0;
+}
+
+HWND getActualUwpWindow(HWND parent) {
+    if (!parent || !IsWindow(parent)) {
+        return nullptr;
+    }
+    DWORD parentId = 0;
+    GetWindowThreadProcessId(parent, &parentId);
+    HWND child = FindWindowExW(parent, nullptr, nullptr, nullptr);
+    while (child) {
+        DWORD childId = 0;
+        GetWindowThreadProcessId(child, &childId);
+        if (childId != parentId) {
+            return child;
+        }
+        child = FindWindowExW(parent, child, nullptr, nullptr);
+    }
+    return nullptr;
+}
+
 struct GdiThumbnailSurface {
     HDC screen = nullptr;
     HDC memory = nullptr;
@@ -278,9 +307,24 @@ struct GdiThumbnailSurface {
 };
 
 ThumbnailPixels captureNativeThumbnail(HWND hwnd) {
+    if (isUwpWindow(hwnd)) {
+        HWND child = getActualUwpWindow(hwnd);
+        if (child) {
+            hwnd = child;
+        }
+    }
+
     // Get window dimensions
-    RECT rect;
-    if (!GetWindowRect(hwnd, &rect)) {
+    RECT rect = {};
+    if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT wp = {};
+        wp.length = sizeof(WINDOWPLACEMENT);
+        if (GetWindowPlacement(hwnd, &wp)) {
+            rect = wp.rcNormalPosition;
+        } else if (!GetWindowRect(hwnd, &rect)) {
+            return {};
+        }
+    } else if (!GetWindowRect(hwnd, &rect)) {
         return {};
     }
 
@@ -307,12 +351,7 @@ ThumbnailPixels captureNativeThumbnail(HWND hwnd) {
     BOOL captured = PrintWindow(hwnd, hdcMem, PW_RENDERFULLCONTENT);
 
     if (!captured) {
-        // Fall back to BitBlt from window DC
-        HDC hdcWindow = GetWindowDC(hwnd);
-        if (hdcWindow) {
-            captured = BitBlt(hdcMem, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
-            ReleaseDC(hwnd, hdcWindow);
-        }
+        captured = PrintWindow(hwnd, hdcMem, 0);
     }
 
     if (!captured) {
@@ -344,6 +383,10 @@ ThumbnailPixels captureNativeThumbnail(HWND hwnd) {
         return {};
     }
 
+    for (size_t i = 3; i < bits.size(); i += 4) {
+        bits[i] = 255;
+    }
+
     return {width, height, std::move(bits)};
 }
 
@@ -352,20 +395,6 @@ ThumbnailPixels captureNativeThumbnail(HWND hwnd) {
 // shutdown does not wait on a foreign window's message loop.
 std::mutex thumbnailWorkerMutex;
 std::shared_future<ThumbnailPixels> thumbnailWorkerResult;
-
-QPixmap captureViaScreenGrab(HWND hwnd, int maxWidth, int maxHeight) {
-    auto *screen = QGuiApplication::primaryScreen();
-    if (!screen) {
-        return QPixmap();
-    }
-
-    const WId winId = static_cast<WId>(reinterpret_cast<quintptr>(hwnd));
-    QPixmap grabbed = screen->grabWindow(winId);
-    if (grabbed.isNull()) {
-        return QPixmap();
-    }
-    return grabbed.scaled(maxWidth, maxHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-}
 
 #ifdef VERSUS_USE_GRAPHICS_CAPTURE
 
@@ -468,8 +497,33 @@ class WindowCapture::Impl {
         std::vector<WindowInfo> windows;
         EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
             auto *list = reinterpret_cast<std::vector<WindowInfo> *>(lParam);
-            if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+            if (!IsWindowVisible(hwnd)) {
                 return TRUE;
+            }
+
+            LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+            if (style & WS_CHILD) {
+                return TRUE;
+            }
+
+            LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if (exStyle & WS_EX_TOOLWINDOW) {
+                return TRUE;
+            }
+
+            int cloaked = 0;
+            if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) {
+                return TRUE;
+            }
+
+            wchar_t className[256] = {};
+            if (GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) > 0) {
+                if (wcscmp(className, L"Progman") == 0 ||
+                    wcscmp(className, L"WorkerW") == 0 ||
+                    wcscmp(className, L"Shell_TrayWnd") == 0 ||
+                    wcscmp(className, L"Shell_SecondaryTrayWnd") == 0) {
+                    return TRUE;
+                }
             }
 
             int titleLen = GetWindowTextLengthW(hwnd);
@@ -487,6 +541,17 @@ class WindowCapture::Impl {
 
             DWORD processId = 0;
             GetWindowThreadProcessId(hwnd, &processId);
+
+            if (isUwpWindow(hwnd)) {
+                HWND child = getActualUwpWindow(hwnd);
+                if (child) {
+                    DWORD childPid = 0;
+                    GetWindowThreadProcessId(child, &childPid);
+                    if (childPid != 0) {
+                        processId = childPid;
+                    }
+                }
+            }
 
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
             std::string executableName;
@@ -506,8 +571,16 @@ class WindowCapture::Impl {
                 CloseHandle(hProcess);
             }
 
-            RECT rect;
-            GetWindowRect(hwnd, &rect);
+            RECT rect = {};
+            if (IsIconic(hwnd)) {
+                WINDOWPLACEMENT wp = {};
+                wp.length = sizeof(WINDOWPLACEMENT);
+                if (GetWindowPlacement(hwnd, &wp)) {
+                    rect = wp.rcNormalPosition;
+                }
+            } else {
+                GetWindowRect(hwnd, &rect);
+            }
             int width = rect.right - rect.left;
             int height = rect.bottom - rect.top;
             if (width < 100 || height < 100) {
@@ -538,7 +611,18 @@ class WindowCapture::Impl {
             spdlog::info("[Capture::Impl] Retiring previous capture session before restart");
             stopCapture();
         }
-        targetHwnd_ = hwnd;
+
+        HWND targetHwnd = hwnd;
+        if (isUwpWindow(targetHwnd)) {
+            HWND child = getActualUwpWindow(targetHwnd);
+            if (child) {
+                spdlog::info("[Capture::Impl] Resolved UWP ApplicationFrameWindow {} to child {}",
+                             (void*)targetHwnd, (void*)child);
+                targetHwnd = child;
+            }
+        }
+
+        targetHwnd_ = targetHwnd;
         targetWidth_ = width;
         targetHeight_ = height;
         targetFps_ = fps;
@@ -548,11 +632,14 @@ class WindowCapture::Impl {
         framesSkippedBeforeReadback_.store(0, std::memory_order_relaxed);
 
         if (useGraphicsCapture_) {
-            spdlog::info("[Capture::Impl] Using Windows Graphics Capture API");
-            return startGraphicsCapture(hwnd);
+            spdlog::info("[Capture::Impl] Using Windows Graphics Capture API for hwnd={}", (void*)targetHwnd);
+            if (startGraphicsCapture(targetHwnd)) {
+                return true;
+            }
+            spdlog::warn("[Capture::Impl] Windows Graphics Capture failed, falling back to GDI capture");
         }
-        spdlog::info("[Capture::Impl] Using Desktop Duplication fallback");
-        return startDesktopDuplication();
+        spdlog::info("[Capture::Impl] Using GDI fallback for hwnd={}", (void*)targetHwnd);
+        return startGdiCapture(targetHwnd);
     }
 
     void stopCapture() {
@@ -702,6 +789,23 @@ class WindowCapture::Impl {
     }
 #endif
 
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice createDirect3DDevice() {
+        if (!device_) {
+            return nullptr;
+        }
+        winrt::com_ptr<IDXGIDevice> dxgiDevice;
+        HRESULT hr = device_->QueryInterface(dxgiDevice.put());
+        if (FAILED(hr) || !dxgiDevice) {
+            return nullptr;
+        }
+        winrt::com_ptr<::IInspectable> inspectable;
+        hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put());
+        if (FAILED(hr) || !inspectable) {
+            return nullptr;
+        }
+        return inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+    }
+
     bool startGraphicsCapture(HWND hwnd) {
         try {
             spdlog::info("[Capture::Impl] startGraphicsCapture for hwnd={}", (void*)hwnd);
@@ -730,17 +834,11 @@ class WindowCapture::Impl {
             });
             captureItemClosedTokenSet_ = true;
 
-            winrt::com_ptr<IDXGIDevice> dxgiDevice;
-            device_->QueryInterface(dxgiDevice.put());
-
-            winrt::com_ptr<::IInspectable> inspectable;
-            hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put());
-            if (FAILED(hr)) {
-                spdlog::error("[Capture::Impl] CreateDirect3D11DeviceFromDXGIDevice failed hr=0x{:08x}", (unsigned int)hr);
+            auto d3dDevice = createDirect3DDevice();
+            if (!d3dDevice) {
+                spdlog::error("[Capture::Impl] createDirect3DDevice failed");
                 return false;
             }
-
-            auto d3dDevice = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
             auto size = captureItem_.Size();
             if (size.Width <= 0 || size.Height <= 0) {
                 spdlog::error("[Capture::Impl] Invalid capture item size {}x{}", size.Width, size.Height);
@@ -801,57 +899,108 @@ class WindowCapture::Impl {
         }
     }
 
-    bool startDesktopDuplication() {
-        winrt::com_ptr<IDXGIDevice> dxgiDevice;
-        HRESULT hr = device_->QueryInterface(dxgiDevice.put());
-        if (FAILED(hr) || !dxgiDevice) {
-            spdlog::warn("[Capture::Impl] QueryInterface(IDXGIDevice) failed hr=0x{:08x}",
-                         static_cast<unsigned int>(hr));
-            return false;
-        }
-        winrt::com_ptr<IDXGIAdapter> adapter;
-        hr = dxgiDevice->GetAdapter(adapter.put());
-        if (FAILED(hr) || !adapter) {
-            spdlog::warn("[Capture::Impl] IDXGIDevice::GetAdapter failed hr=0x{:08x}",
-                         static_cast<unsigned int>(hr));
-            return false;
-        }
-        winrt::com_ptr<IDXGIOutput> output;
-        hr = adapter->EnumOutputs(0, output.put());
-        if (FAILED(hr) || !output) {
-            spdlog::warn("[Capture::Impl] IDXGIAdapter::EnumOutputs failed hr=0x{:08x}",
-                         static_cast<unsigned int>(hr));
-            return false;
-        }
-        DXGI_OUTPUT_DESC outputDesc = {};
-        if (SUCCEEDED(output->GetDesc(&outputDesc))) {
-            desktopLeft_ = outputDesc.DesktopCoordinates.left;
-            desktopTop_ = outputDesc.DesktopCoordinates.top;
-            desktopRight_ = outputDesc.DesktopCoordinates.right;
-            desktopBottom_ = outputDesc.DesktopCoordinates.bottom;
-        } else {
-            desktopLeft_ = 0;
-            desktopTop_ = 0;
-            desktopRight_ = 0;
-            desktopBottom_ = 0;
-        }
-        winrt::com_ptr<IDXGIOutput1> output1;
-        hr = output->QueryInterface(output1.put());
-        if (FAILED(hr) || !output1) {
-            spdlog::warn("[Capture::Impl] QueryInterface(IDXGIOutput1) failed hr=0x{:08x}",
-                         static_cast<unsigned int>(hr));
-            return false;
-        }
-        outputDuplication_ = nullptr;
-        desktopCropWarningLogged_ = false;
-        hr = output1->DuplicateOutput(device_.get(), outputDuplication_.put());
-        if (FAILED(hr)) {
-            spdlog::warn("[Capture::Impl] DuplicateOutput failed hr=0x{:08x}", static_cast<unsigned int>(hr));
+    bool startGdiCapture(HWND hwnd) {
+        if (!hwnd || !IsWindow(hwnd)) {
+            spdlog::warn("[Capture::Impl] Cannot start GDI capture: invalid window handle");
             return false;
         }
         capturing_.store(true, std::memory_order_release);
-        captureThread_ = std::thread([this]() { captureLoop(); });
+        captureThread_ = std::thread([this, hwnd]() { captureGdiLoop(hwnd); });
         return true;
+    }
+
+    void captureGdiLoop(HWND hwnd) {
+        spdlog::info("[Capture::Impl] Starting GDI capture loop for hwnd={}", (void*)hwnd);
+        while (capturing_.load(std::memory_order_acquire)) {
+            const auto loopStart = std::chrono::steady_clock::now();
+
+            if (!IsWindow(hwnd)) {
+                spdlog::warn("[Capture::Impl] Target window closed during GDI capture");
+                capturing_.store(false, std::memory_order_release);
+                break;
+            }
+
+            if (IsIconic(hwnd)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            RECT rect = {};
+            if (!GetWindowRect(hwnd, &rect)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            const int width = rect.right - rect.left;
+            const int height = rect.bottom - rect.top;
+            if (width <= 0 || height <= 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            HDC hdcScreen = GetDC(nullptr);
+            if (hdcScreen) {
+                HDC hdcMem = CreateCompatibleDC(hdcScreen);
+                HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
+                if (hdcMem && hBitmap) {
+                    HGDIOBJ oldBmp = SelectObject(hdcMem, hBitmap);
+
+                    BOOL captured = PrintWindow(hwnd, hdcMem, PW_RENDERFULLCONTENT);
+                    if (!captured) {
+                        captured = PrintWindow(hwnd, hdcMem, 0);
+                    }
+
+                    if (captured) {
+                        BITMAPINFOHEADER bi = {};
+                        bi.biSize = sizeof(BITMAPINFOHEADER);
+                        bi.biWidth = width;
+                        bi.biHeight = -height;
+                        bi.biPlanes = 1;
+                        bi.biBitCount = 32;
+                        bi.biCompression = BI_RGB;
+
+                        CapturedFrame frame;
+                        frame.width = width;
+                        frame.height = height;
+                        frame.stride = width * 4;
+                        frame.format = CapturedFrame::Format::BGRA;
+                        frame.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            loopStart.time_since_epoch()).count();
+                        frame.data.resize(static_cast<size_t>(frame.stride) * static_cast<size_t>(frame.height));
+
+                        SelectObject(hdcMem, oldBmp);
+                        oldBmp = nullptr;
+
+                        int scanlines = GetDIBits(hdcMem, hBitmap, 0, height, frame.data.data(),
+                                                  reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+                        if (scanlines == height) {
+                            for (size_t i = 3; i < frame.data.size(); i += 4) {
+                                frame.data[i] = 255;
+                            }
+                            if (frameCallback_) {
+                                frameCallback_(frame);
+                            }
+                        }
+                    }
+
+                    if (oldBmp) {
+                        SelectObject(hdcMem, oldBmp);
+                    }
+                    DeleteObject(hBitmap);
+                    DeleteDC(hdcMem);
+                }
+                ReleaseDC(nullptr, hdcScreen);
+            }
+
+            const int targetFps = requestedFps_.load(std::memory_order_relaxed);
+            const int frameIntervalMs = targetFps > 0 ? (1000 / targetFps) : 16;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - loopStart).count();
+            if (elapsed < frameIntervalMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(frameIntervalMs - elapsed));
+            }
+        }
+        spdlog::info("[Capture::Impl] GDI capture loop ended");
     }
 
     void onFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender) {
@@ -894,26 +1043,33 @@ class WindowCapture::Impl {
         }
 
         if ((contentWidth != lastContentWidth_) || (contentHeight != lastContentHeight_)) {
-            lastContentWidth_ = contentWidth;
-            lastContentHeight_ = contentHeight;
-            if (framePool_ && graphicsDevice_) {
-                try {
-                    framePool_.Recreate(
-                        graphicsDevice_,
-                        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                        kFramePoolBufferCount,
-                        contentSize);
-                    spdlog::info("[Capture::Impl] Capture content resized, recreated frame pool: {}x{}",
-                                 contentWidth,
-                                 contentHeight);
-                } catch (const winrt::hresult_error &e) {
-                    spdlog::warn("[Capture::Impl] Frame pool recreate failed hr=0x{:08x} msg={}",
-                                 static_cast<unsigned int>(e.code()),
-                                 winrt::to_string(e.message()));
-                } catch (...) {
-                    spdlog::warn("[Capture::Impl] Frame pool recreate failed with unknown exception");
+            if (framePool_) {
+                auto recreateDevice = createDirect3DDevice();
+                if (!recreateDevice) {
+                    recreateDevice = graphicsDevice_;
+                }
+                if (recreateDevice) {
+                    try {
+                        framePool_.Recreate(
+                            recreateDevice,
+                            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                            kFramePoolBufferCount,
+                            contentSize);
+                        graphicsDevice_ = recreateDevice;
+                        spdlog::info("[Capture::Impl] Capture content resized, recreated frame pool: {}x{}",
+                                     contentWidth,
+                                     contentHeight);
+                    } catch (const winrt::hresult_error &e) {
+                        spdlog::warn("[Capture::Impl] Frame pool recreate failed hr=0x{:08x} msg={}",
+                                     static_cast<unsigned int>(e.code()),
+                                     winrt::to_string(e.message()));
+                    } catch (...) {
+                        spdlog::warn("[Capture::Impl] Frame pool recreate failed with unknown exception");
+                    }
                 }
             }
+            lastContentWidth_ = contentWidth;
+            lastContentHeight_ = contentHeight;
             return;
         }
 
@@ -930,71 +1086,7 @@ class WindowCapture::Impl {
         processFrame(texture.get(), timestamp, contentWidth, contentHeight, 0, 0);
     }
 
-    void captureLoop() {
-        while (capturing_.load(std::memory_order_acquire)) {
-            winrt::com_ptr<IDXGIResource> resource;
-            DXGI_OUTDUPL_FRAME_INFO frameInfo;
-            HRESULT hr = outputDuplication_->AcquireNextFrame(100, &frameInfo, resource.put());
-            if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-                continue;
-            }
-            if (FAILED(hr)) {
-                spdlog::warn("[Capture::Impl] Desktop duplication frame acquisition failed hr=0x{:08x}",
-                             static_cast<unsigned int>(hr));
-                capturing_.store(false, std::memory_order_release);
-                break;
-            }
-            ScopedOutputDuplicationFrame releaseFrame{outputDuplication_.get(), true};
-            winrt::com_ptr<ID3D11Texture2D> texture;
-            hr = resource->QueryInterface(texture.put());
-            if (FAILED(hr) || !texture) {
-                spdlog::warn("[Capture::Impl] Desktop duplication frame was not a texture hr=0x{:08x}",
-                             static_cast<unsigned int>(hr));
-                continue;
-            }
-            D3D11_TEXTURE2D_DESC desc;
-            texture->GetDesc(&desc);
-            int sourceX = 0;
-            int sourceY = 0;
-            int contentWidth = static_cast<int>(desc.Width);
-            int contentHeight = static_cast<int>(desc.Height);
-            if (targetHwnd_) {
-                RECT windowRect = {};
-                if (!IsWindow(targetHwnd_) || !GetWindowRect(targetHwnd_, &windowRect)) {
-                    spdlog::warn("[Capture::Impl] Target window closed during desktop duplication capture");
-                    capturing_.store(false, std::memory_order_release);
-                    break;
-                }
 
-                const LONG desktopLeft = desktopRight_ > desktopLeft_ ? desktopLeft_ : 0;
-                const LONG desktopTop = desktopBottom_ > desktopTop_ ? desktopTop_ : 0;
-                const LONG desktopRight = desktopRight_ > desktopLeft_ ? desktopRight_ : static_cast<LONG>(desc.Width);
-                const LONG desktopBottom = desktopBottom_ > desktopTop_ ? desktopBottom_ : static_cast<LONG>(desc.Height);
-                const LONG cropLeft = std::max(windowRect.left, desktopLeft);
-                const LONG cropTop = std::max(windowRect.top, desktopTop);
-                const LONG cropRight = std::min(windowRect.right, desktopRight);
-                const LONG cropBottom = std::min(windowRect.bottom, desktopBottom);
-                if (cropRight <= cropLeft || cropBottom <= cropTop) {
-                    if (!desktopCropWarningLogged_) {
-                        spdlog::warn("[Capture::Impl] Target window is outside duplicated output; waiting for it to return");
-                        desktopCropWarningLogged_ = true;
-                    }
-                    continue;
-                }
-                desktopCropWarningLogged_ = false;
-                sourceX = static_cast<int>(cropLeft - desktopLeft);
-                sourceY = static_cast<int>(cropTop - desktopTop);
-                contentWidth = static_cast<int>(cropRight - cropLeft);
-                contentHeight = static_cast<int>(cropBottom - cropTop);
-            }
-            processFrame(texture.get(),
-                         frameInfo.LastPresentTime.QuadPart,
-                         contentWidth,
-                         contentHeight,
-                         sourceX,
-                         sourceY);
-        }
-    }
 
     void processFrame(ID3D11Texture2D *texture,
                       int64_t timestamp,
@@ -1542,9 +1634,7 @@ QPixmap WindowCapture::captureWindowThumbnail(const std::string &windowId, int m
                 result = thumbnailWorkerResult;
             }
         }
-        // While a source is stalled, use the existing non-PrintWindow fallback
-        // for subsequent requests without launching another worker or waiting.
-        if (result.valid() && result.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
+        if (result.valid() && result.wait_for(std::chrono::milliseconds(150)) == std::future_status::ready) {
             const auto &native = result.get();
             if (!native.pixels.empty()) {
                 QImage image(native.pixels.data(), native.width, native.height,
@@ -1556,7 +1646,7 @@ QPixmap WindowCapture::captureWindowThumbnail(const std::string &windowId, int m
     } catch (const std::exception &error) {
         spdlog::warn("[WindowCapture] Thumbnail capture failed: {}", error.what());
     }
-    return captureViaScreenGrab(hwnd, maxWidth, maxHeight);
+    return {};
 #else
     Q_UNUSED(windowId)
     Q_UNUSED(maxWidth)
