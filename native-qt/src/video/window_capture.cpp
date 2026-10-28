@@ -571,7 +571,15 @@ class WindowCapture::Impl {
         frameCallbackState_.reset();
         // Retire the frame pool before releasing resources used by its callbacks.
         if (framePool_) {
-            framePool_.Close();
+            try {
+                framePool_.Close();
+            } catch (const winrt::hresult_error &e) {
+                spdlog::debug("[Capture::Impl] framePool_.Close() error hr=0x{:08x}", (unsigned int)e.code());
+            } catch (const std::exception &e) {
+                spdlog::debug("[Capture::Impl] framePool_.Close() exception: {}", e.what());
+            } catch (...) {
+                spdlog::debug("[Capture::Impl] framePool_.Close() unknown exception");
+            }
             framePool_ = nullptr;
         }
         outputDuplication_ = nullptr;
@@ -587,7 +595,15 @@ class WindowCapture::Impl {
         stagingWidth_ = 0;
         stagingHeight_ = 0;
         if (captureSession_) {
-            captureSession_.Close();
+            try {
+                captureSession_.Close();
+            } catch (const winrt::hresult_error &e) {
+                spdlog::debug("[Capture::Impl] captureSession_.Close() error hr=0x{:08x}", (unsigned int)e.code());
+            } catch (const std::exception &e) {
+                spdlog::debug("[Capture::Impl] captureSession_.Close() exception: {}", e.what());
+            } catch (...) {
+                spdlog::debug("[Capture::Impl] captureSession_.Close() unknown exception");
+            }
             captureSession_ = nullptr;
         }
 #ifdef VERSUS_USE_GRAPHICS_CAPTURE
@@ -1451,18 +1467,40 @@ bool WindowCapture::startCapture(const std::string &windowId,
         return false;
     }
     spdlog::info("[Capture] Window handle valid, calling impl->startCapture");
-    capturing_.store(
-        impl_->startCapture(hwnd, width, height, fps, preserveAlpha),
-        std::memory_order_release);
-    spdlog::info("[Capture] impl->startCapture returned {}", capturing_.load(std::memory_order_acquire));
-    return capturing_.load(std::memory_order_acquire);
+    try {
+        capturing_.store(
+            impl_->startCapture(hwnd, width, height, fps, preserveAlpha),
+            std::memory_order_release);
+        spdlog::info("[Capture] impl->startCapture returned {}", capturing_.load(std::memory_order_acquire));
+        return capturing_.load(std::memory_order_acquire);
+    } catch (const winrt::hresult_error &e) {
+        spdlog::error("[Capture] WinRT exception in startCapture: hr=0x{:08x}", (unsigned int)e.code());
+        capturing_.store(false, std::memory_order_release);
+        return false;
+    } catch (const std::exception &e) {
+        spdlog::error("[Capture] Exception in startCapture: {}", e.what());
+        capturing_.store(false, std::memory_order_release);
+        return false;
+    } catch (...) {
+        spdlog::error("[Capture] Unknown exception in startCapture");
+        capturing_.store(false, std::memory_order_release);
+        return false;
+    }
 #else
     return false;
 #endif
 }
 
 void WindowCapture::stopCapture() {
-    impl_->stopCapture();
+    try {
+        impl_->stopCapture();
+    } catch (const winrt::hresult_error &e) {
+        spdlog::warn("[Capture] WinRT exception in stopCapture: hr=0x{:08x}", (unsigned int)e.code());
+    } catch (const std::exception &e) {
+        spdlog::warn("[Capture] Exception in stopCapture: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[Capture] Unknown exception in stopCapture");
+    }
     capturing_.store(false, std::memory_order_release);
 }
 

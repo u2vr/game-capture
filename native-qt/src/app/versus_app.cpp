@@ -13,6 +13,11 @@
 #include <spdlog/spdlog.h>
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QSaveFile>
+#include <QtGui/QImage>
+#include <QtGui/QPainter>
+#include <QtGui/QFont>
+#include <QtGui/QFontMetrics>
+#include <QtGui/QColor>
 
 #include <algorithm>
 #include <array>
@@ -954,13 +959,14 @@ bool VersusApp::startCapture(VideoSourceMode mode, const std::string &sourceId) 
                 captureConfig.frameRate > 0 ? captureConfig.frameRate : 60,
                 captureConfig.enableAlpha ||
                     captureConfig.alphaBackgroundMode != video::AlphaBackgroundMode::None)) {
-            return false;
-        }
-        auto windows = windowCapture_.getWindows();
-        for (const auto &info : windows) {
-            if (info.id == sourceId) {
-                selectedWindowProcessId = info.processId;
-                break;
+            spdlog::warn("[App] Initial window capture failed for '{}'; streaming placeholder", sourceId);
+        } else {
+            auto windows = windowCapture_.getWindows();
+            for (const auto &info : windows) {
+                if (info.id == sourceId) {
+                    selectedWindowProcessId = info.processId;
+                    break;
+                }
             }
         }
     } else if (mode == VideoSourceMode::Spout) {
@@ -974,7 +980,7 @@ bool VersusApp::startCapture(VideoSourceMode mode, const std::string &sourceId) 
                 captureConfig.width,
                 captureConfig.height,
                 captureConfig.frameRate > 0 ? captureConfig.frameRate : 60)) {
-            return false;
+            spdlog::warn("[App] Initial Spout capture failed for '{}'; streaming placeholder", sourceId);
         }
     } else if (mode == VideoSourceMode::Camera) {
         video::EncoderConfig captureConfig;
@@ -988,15 +994,11 @@ bool VersusApp::startCapture(VideoSourceMode mode, const std::string &sourceId) 
                 captureConfig.height > 0 ? captureConfig.height : 1080,
                 captureConfig.frameRate > 0 ? captureConfig.frameRate : 30)) {
             const std::string detail = cameraCapture_.lastError();
-            spdlog::warn("[App] Camera capture failed: {}",
+            spdlog::warn("[App] Camera capture failed: {}; streaming placeholder",
                          detail.empty() ? "unknown error" : detail);
-            emitRuntimeEvent(
-                detail.empty()
-                    ? "Failed to open the selected camera."
-                    : detail,
-                false);
-            return false;
         }
+    } else if (sourceId.empty()) {
+        spdlog::info("[App] Capture started without an initial source; placeholder will stream");
     } else {
         return false;
     }
@@ -1233,6 +1235,256 @@ void VersusApp::setVideoSourceMode(VideoSourceMode mode) {
     videoSourceMode_ = mode;
 }
 
+bool VersusApp::isSourceCapturing() const {
+    const auto lifecycle = lifecycleStateSnapshot();
+    if (lifecycle.selectedWindowId.empty()) {
+        return false;
+    }
+    switch (lifecycle.videoSourceMode) {
+        case VideoSourceMode::Camera:
+            return cameraCapture_.isCapturing();
+        case VideoSourceMode::Spout:
+            return spoutCapture_.isCapturing();
+        case VideoSourceMode::Window:
+        default:
+            return windowCapture_.isCapturing();
+    }
+}
+
+void VersusApp::setStreamTarget(const std::string &target) {
+    std::lock_guard<std::mutex> lock(placeholderMutex_);
+    streamTarget_ = target;
+    cachedPlaceholderFrame_.reset();
+}
+
+std::string VersusApp::getStreamTarget() const {
+    std::lock_guard<std::mutex> lock(placeholderMutex_);
+    return streamTarget_;
+}
+
+std::shared_ptr<const versus::video::CapturedFrame> VersusApp::getPlaceholderFrame(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        const auto videoState = videoStateSnapshot();
+        width = videoState.config.width > 0 ? videoState.config.width : 1920;
+        height = videoState.config.height > 0 ? videoState.config.height : 1080;
+    }
+    width = std::max(2, width & ~1);
+    height = std::max(2, height & ~1);
+
+    std::string targetText = getStreamTarget();
+    if (targetText.empty()) {
+        const auto lifecycle = lifecycleStateSnapshot();
+        targetText = lifecycle.streamId.empty() ? lifecycle.startOptions.output.url : lifecycle.streamId;
+    }
+
+    std::lock_guard<std::mutex> lock(placeholderMutex_);
+    if (cachedPlaceholderFrame_ &&
+        cachedPlaceholderWidth_ == width &&
+        cachedPlaceholderHeight_ == height &&
+        cachedPlaceholderTarget_ == targetText) {
+        return cachedPlaceholderFrame_;
+    }
+
+    QImage image(width, height, QImage::Format_RGB32);
+    image.fill(QColor(18, 18, 22));
+
+    {
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+        const int fontSizeLine1 = std::max(12, height / 32);
+        const int fontSizeLine2 = std::max(16, height / 22);
+
+        QFont fontLine1(QStringLiteral("Segoe UI"), fontSizeLine1, QFont::Normal);
+        QFont fontLine2(QStringLiteral("Segoe UI"), fontSizeLine2, QFont::Bold);
+
+        QFontMetrics fm1(fontLine1);
+        QFontMetrics fm2(fontLine2);
+
+        QString textLine1 = QString::fromStdString(targetText).trimmed();
+        if (textLine1.isEmpty()) {
+            textLine1 = QStringLiteral("Stream / URL");
+        }
+        const int maxTextWidth = std::max(50, width - 80);
+        textLine1 = fm1.elidedText(textLine1, Qt::ElideMiddle, maxTextWidth);
+
+        const QString textLine2 = QString::fromUtf8("Не выбран источник");
+
+        const int lineSpacing = std::max(8, height / 40);
+        const int totalHeight = fm1.height() + lineSpacing + fm2.height();
+        const int startY = (height - totalHeight) / 2;
+
+        const QRect rect1(40, startY, width - 80, fm1.height());
+        const QRect rect2(40, startY + fm1.height() + lineSpacing, width - 80, fm2.height());
+
+        painter.setFont(fontLine1);
+        painter.setPen(QColor(180, 185, 195));
+        painter.drawText(rect1, Qt::AlignCenter | Qt::TextSingleLine, textLine1);
+
+        painter.setFont(fontLine2);
+        painter.setPen(QColor(255, 255, 255));
+        painter.drawText(rect2, Qt::AlignCenter | Qt::TextSingleLine, textLine2);
+    }
+
+    auto frame = std::make_shared<video::CapturedFrame>();
+    frame->width = width;
+    frame->height = height;
+    frame->stride = static_cast<int>(image.bytesPerLine());
+    frame->format = video::CapturedFrame::Format::BGRA;
+    frame->data.resize(image.sizeInBytes());
+    std::memcpy(frame->data.data(), image.constBits(), image.sizeInBytes());
+
+    cachedPlaceholderFrame_ = frame;
+    cachedPlaceholderWidth_ = width;
+    cachedPlaceholderHeight_ = height;
+    cachedPlaceholderTarget_ = targetText;
+    return cachedPlaceholderFrame_;
+}
+
+bool VersusApp::switchCaptureSource(VideoSourceMode mode, const std::string &sourceId) {
+    std::lock_guard<std::mutex> lock(runtimeVideoControlMutex_);
+    {
+        std::lock_guard<std::mutex> stateLock(lifecycleStateMutex_);
+        selectedWindowId_ = sourceId;
+        videoSourceMode_ = mode;
+    }
+    resetSourceHealth(mode, sourceId);
+    captureBackendFailureNotified_.store(false, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> notifyLock(encodeNotifyMutex_);
+        std::lock_guard<std::mutex> frameLock(latestVideoFrameMutex_);
+        pendingVideoFrames_.clear();
+        cachedVideoFrame_.reset();
+    }
+
+    try {
+        windowCapture_.stopCapture();
+    } catch (const std::exception &e) {
+        spdlog::warn("[App] Exception stopping window capture: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[App] Unknown exception stopping window capture");
+    }
+
+    try {
+        spoutCapture_.stopCapture();
+    } catch (const std::exception &e) {
+        spdlog::warn("[App] Exception stopping Spout capture: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[App] Unknown exception stopping Spout capture");
+    }
+
+    try {
+        cameraCapture_.stopCapture();
+    } catch (const std::exception &e) {
+        spdlog::warn("[App] Exception stopping camera capture: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[App] Unknown exception stopping camera capture");
+    }
+
+    if (sourceId.empty()) {
+        try {
+            const auto lifecycle = lifecycleStateSnapshot();
+            if (lifecycle.audioSourceMode == AudioSourceMode::SelectedWindow) {
+                audioCapture_.StopCapture();
+            }
+        } catch (...) {
+        }
+        pendingGlobalKeyframe_.store(true, std::memory_order_relaxed);
+        spdlog::info("[App] Switched capture source to empty; placeholder will stream");
+        return true;
+    }
+
+    video::EncoderConfig captureConfig;
+    {
+        std::lock_guard<std::mutex> sendLock(videoSendMutex_);
+        captureConfig = videoConfig_;
+    }
+
+    const auto frameCallback = [this](video::CapturedFrame frame) {
+        handleVideoFrame(std::move(frame));
+    };
+    try {
+        windowCapture_.setFrameCallback(frameCallback);
+        windowCapture_.setFrameAdmissionCallback([this]() {
+            return !live_.load(std::memory_order_acquire) ||
+                encodeThreadRunning_.load(std::memory_order_acquire);
+        });
+        spoutCapture_.setFrameCallback(frameCallback);
+        cameraCapture_.setFrameCallback(frameCallback);
+    } catch (...) {
+    }
+
+    uint32_t selectedWindowProcessId = 0;
+    bool success = false;
+    try {
+        if (mode == VideoSourceMode::Window) {
+            success = windowCapture_.startCapture(
+                sourceId,
+                captureConfig.width > 0 ? captureConfig.width : 1920,
+                captureConfig.height > 0 ? captureConfig.height : 1080,
+                captureConfig.frameRate > 0 ? captureConfig.frameRate : 60,
+                captureConfig.enableAlpha ||
+                    captureConfig.alphaBackgroundMode != video::AlphaBackgroundMode::None);
+            if (success) {
+                auto windows = windowCapture_.getWindows();
+                for (const auto &info : windows) {
+                    if (info.id == sourceId) {
+                        selectedWindowProcessId = info.processId;
+                        break;
+                    }
+                }
+            }
+        } else if (mode == VideoSourceMode::Spout) {
+            success = spoutCapture_.startCapture(
+                sourceId,
+                captureConfig.width,
+                captureConfig.height,
+                captureConfig.frameRate > 0 ? captureConfig.frameRate : 60);
+        } else if (mode == VideoSourceMode::Camera) {
+            success = cameraCapture_.startCapture(
+                sourceId,
+                captureConfig.width > 0 ? captureConfig.width : 1920,
+                captureConfig.height > 0 ? captureConfig.height : 1080,
+                captureConfig.frameRate > 0 ? captureConfig.frameRate : 30);
+        }
+    } catch (const std::exception &e) {
+        spdlog::warn("[App] Exception starting capture during switch: {}", e.what());
+        success = false;
+    } catch (...) {
+        spdlog::warn("[App] Unknown exception starting capture during switch");
+        success = false;
+    }
+
+    if (!success) {
+        spdlog::warn("[App] Failed to start capture for switched source '{}'; streaming placeholder", sourceId);
+    } else {
+        spdlog::info("[App] Switched capture source to mode={} id='{}'",
+                     videoSourceModeName(mode), sourceId);
+    }
+
+    try {
+        const auto lifecycle = lifecycleStateSnapshot();
+        if (lifecycle.audioSourceMode == AudioSourceMode::SelectedWindow) {
+            if (selectedWindowProcessId != 0) {
+                audioCapture_.StartStreamCapture(selectedWindowProcessId, [this](versus::audio::StreamChunk &&chunk) {
+                    handlePrimaryAudioChunk(std::move(chunk));
+                });
+            } else {
+                audioCapture_.StopCapture();
+            }
+        }
+    } catch (const std::exception &e) {
+        spdlog::warn("[App] Exception updating audio during switch: {}", e.what());
+    } catch (...) {
+        spdlog::warn("[App] Unknown exception updating audio during switch");
+    }
+
+    pendingGlobalKeyframe_.store(true, std::memory_order_relaxed);
+    return success;
+}
+
 void VersusApp::setVideoConfig(const versus::video::EncoderConfig &config) {
     bool enteredCodecUnavailable = false;
     video::VideoCodec committedCodec = config.codec;
@@ -1361,6 +1613,7 @@ bool VersusApp::goLive(const StartOptions &options) {
 
     maxViewers_.store(std::max(0, options.maxViewers), std::memory_order_relaxed);
     remoteControlEnabled_.store(options.remoteControlEnabled, std::memory_order_relaxed);
+    setStreamTarget(options.streamTarget);
     if (options.output.protocol != output::Protocol::VdoNinja) {
         const auto error = output::validateConfig(options.output);
         const auto videoState = videoStateSnapshot();
@@ -1806,6 +2059,9 @@ SourceHealth VersusApp::getSourceHealth() const {
 }
 
 std::shared_ptr<const video::CapturedFrame> VersusApp::getPublisherPreviewFrame() {
+    if (!isSourceCapturing()) {
+        return getPlaceholderFrame();
+    }
     return getCachedVideoFrame();
 }
 
@@ -2136,7 +2392,9 @@ std::string VersusApp::buildDiagnosticsJson() const {
         {"color_content_ratio", sourceHealth.colorContentRatio},
         {"alpha_detected", sourceHealth.alphaDetected},
         {"green_background_likely", sourceHealth.greenBackgroundLikely},
-        {"large_source", sourceHealth.largeSource}
+        {"large_source", sourceHealth.largeSource},
+        {"capturing", isSourceCapturing()},
+        {"stream_target", getStreamTarget()}
     };
     root["signaling"] = {
         {"server", diagnosticsServer},
@@ -7349,52 +7607,38 @@ void VersusApp::startVideoMaintenanceThread() {
         return;
     }
 
-    const VideoSourceMode sourceMode = lifecycleStateSnapshot().videoSourceMode;
-    videoMaintenanceThread_ = std::thread([this, sourceMode]() {
+    videoMaintenanceThread_ = std::thread([this]() {
         int64_t lastInfoBroadcastMs = 0;
+        bool wasSourceCapturing = false;
         while (videoMaintenanceRunning_.load()) {
+            const LifecycleStateSnapshot lifecycle = lifecycleStateSnapshot();
+            const VideoSourceMode sourceMode = lifecycle.videoSourceMode;
             bool sourceCapturing = false;
-            switch (sourceMode) {
-                case VideoSourceMode::Camera:
-                    sourceCapturing = cameraCapture_.isCapturing();
-                    break;
-                case VideoSourceMode::Spout:
-                    sourceCapturing = spoutCapture_.isCapturing();
-                    break;
-                case VideoSourceMode::Window:
-                default:
-                    sourceCapturing = windowCapture_.isCapturing();
-                    break;
-            }
-            if (capturing_.load(std::memory_order_relaxed) && !sourceCapturing) {
-                videoTrackActive_.store(false, std::memory_order_relaxed);
-                pendingGlobalKeyframe_.store(false, std::memory_order_relaxed);
-                if (!captureBackendFailureNotified_.exchange(true, std::memory_order_relaxed)) {
-                    std::string message;
-                    switch (sourceMode) {
-                        case VideoSourceMode::Camera:
-                            message = cameraCapture_.lastError();
-                            if (message.empty()) {
-                                message =
-                                    "Camera capture stopped. Check the camera connection and Windows privacy settings, then start streaming again.";
-                            }
-                            break;
-                        case VideoSourceMode::Spout:
-                            message =
-                                "Spout2 capture stopped. Select a valid Spout2 sender and start streaming again.";
-                            break;
-                        case VideoSourceMode::Window:
-                        default:
-                            message =
-                                "Window capture stopped. Select a valid window and start streaming again.";
-                            break;
-                    }
-                    spdlog::warn("[App] {}", message);
-                    emitRuntimeEvent(message, true);
+            if (!lifecycle.selectedWindowId.empty()) {
+                switch (sourceMode) {
+                    case VideoSourceMode::Camera:
+                        sourceCapturing = cameraCapture_.isCapturing();
+                        break;
+                    case VideoSourceMode::Spout:
+                        sourceCapturing = spoutCapture_.isCapturing();
+                        break;
+                    case VideoSourceMode::Window:
+                    default:
+                        sourceCapturing = windowCapture_.isCapturing();
+                        break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
             }
+            if (wasSourceCapturing && !sourceCapturing) {
+                spdlog::info("[App] Capture source closed or stopped; streaming placeholder");
+                {
+                    std::lock_guard<std::mutex> notifyLock(encodeNotifyMutex_);
+                    std::lock_guard<std::mutex> frameLock(latestVideoFrameMutex_);
+                    pendingVideoFrames_.clear();
+                    cachedVideoFrame_.reset();
+                }
+                pendingGlobalKeyframe_.store(true, std::memory_order_relaxed);
+            }
+            wasSourceCapturing = sourceCapturing;
             if (!live_ || !capturing_) {
                 videoTrackActive_.store(false, std::memory_order_relaxed);
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -7807,7 +8051,9 @@ void VersusApp::startEncodeThread() {
                 // capture publication. A late notification for an already
                 // consumed image must not suppress the next fresh-frame wait.
                 std::lock_guard<std::mutex> frameLock(latestVideoFrameMutex_);
-                if (pendingVideoFrames_.empty()) {
+                if (!isSourceCapturing()) {
+                    frame = getPlaceholderFrame(videoState.config.width, videoState.config.height);
+                } else if (pendingVideoFrames_.empty()) {
                     frame = cachedVideoFrame_;
                 } else {
                     frame = std::move(pendingVideoFrames_.front());

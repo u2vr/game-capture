@@ -327,6 +327,12 @@ if(WIN32)
     target_link_libraries(test-stream PRIVATE ws2_32 bcrypt)
 endif()
 
+if(WIN32 AND VERSUS_USE_SPOUT AND TARGET SpoutLibrary_static)
+    add_executable(spout_test_sender tests/spout_test_sender.cpp)
+    target_link_libraries(spout_test_sender PRIVATE SpoutLibrary_static)
+    target_include_directories(spout_test_sender PRIVATE ${spout2_SOURCE_DIR}/SPOUTSDK/SpoutLibrary ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()
+
 # Testing
 option(VERSUS_BUILD_TESTS "Build tests" OFF)
 

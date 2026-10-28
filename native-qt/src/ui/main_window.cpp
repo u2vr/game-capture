@@ -1,4 +1,4 @@
-﻿#include "versus/ui/main_window.h"
+#include "versus/ui/main_window.h"
 
 #include "versus/ui/update_checker.h"
 
@@ -1476,6 +1476,17 @@ void MainWindow::setupUI() {
         refreshSelectedWindowPreview();
         updateGoLiveButton();
         savePersistedSettings();
+        if (isLive_ && core_) {
+            try {
+                const auto mode = videoSourceModeFromUiValue(sourceMode);
+                core_->switchCaptureSource(mode, std::string());
+                updateStatus("Streaming placeholder (select a source)", "live");
+            } catch (const std::exception &e) {
+                spdlog::error("[MainWindow] Exception switching source mode while live: {}", e.what());
+            } catch (...) {
+                spdlog::error("[MainWindow] Unknown exception switching source mode while live");
+            }
+        }
     });
     sourceLayout->addWidget(sourceLabel);
     sourceLayout->addWidget(sourceModeSelect_, 1);
@@ -2606,28 +2617,43 @@ void MainWindow::applyDarkTheme() {
 }
 
 void MainWindow::onWindowSelected(const QString &windowId) {
-    selectedWindowId_ = windowId;
-    const bool hasSelection = !windowId.isEmpty();
-    refreshSelectedWindowPreview();
-    updateGoLiveButton();
-    if (hasSelection) {
-        const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
-        updateStatus(
-            sourceMode == "spout"
-                ? "Ready to capture Spout2 sender"
-                : (sourceMode == "camera"
-                    ? "Ready to capture camera"
-                    : "Ready to go live"),
-            "ready");
-    } else {
-        const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
-        updateStatus(
-            sourceMode == "spout"
-                ? "Select a Spout2 sender"
-                : (sourceMode == "camera"
-                    ? "Select a camera"
-                    : "Select a window to capture"),
-            "idle");
+    try {
+        selectedWindowId_ = windowId;
+        const bool hasSelection = !windowId.isEmpty();
+        refreshSelectedWindowPreview();
+        updateGoLiveButton();
+        if (isLive_) {
+            const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
+            const auto mode = videoSourceModeFromUiValue(sourceMode);
+            if (core_) {
+                core_->switchCaptureSource(mode, windowId.toStdString());
+            }
+            updateStatus(hasSelection ? "Switched capture source" : "Source cleared - streaming placeholder", "live");
+            return;
+        }
+        if (hasSelection) {
+            const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
+            updateStatus(
+                sourceMode == "spout"
+                    ? "Ready to capture Spout2 sender"
+                    : (sourceMode == "camera"
+                        ? "Ready to capture camera"
+                        : "Ready to go live"),
+                "ready");
+        } else {
+            const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
+            updateStatus(
+                sourceMode == "spout"
+                    ? "Select a Spout2 sender"
+                    : (sourceMode == "camera"
+                        ? "Select a camera"
+                        : "Select a window to capture"),
+                "idle");
+        }
+    } catch (const std::exception &e) {
+        spdlog::error("[MainWindow] Exception in onWindowSelected: {}", e.what());
+    } catch (...) {
+        spdlog::error("[MainWindow] Unknown exception in onWindowSelected");
     }
 }
 
@@ -2843,6 +2869,7 @@ versus::app::StartOptions MainWindow::buildStartOptionsFromUi() const {
     versus::app::StartOptions options;
     options.output = outputConfigFromUi();
     options.streamId = resolvedStreamId.toStdString();
+    options.streamTarget = streamTargetRaw.toStdString();
     options.room = roomText.isEmpty() ? parsedTarget.room.toStdString() : roomText.toStdString();
     options.password = passwordText.isEmpty() ? parsedTarget.password.toStdString() : passwordText.toStdString();
     options.label = labelInput_ ? labelInput_->text().toStdString() : std::string();
@@ -3281,7 +3308,7 @@ void MainWindow::onGoLiveClicked() {
                 }
 
                 if (self->windowListWidget_) {
-                    self->windowListWidget_->setAutoRefreshEnabled(false);
+                    self->windowListWidget_->setAutoRefreshEnabled(true);
                 }
                 self->updateGoLiveButton();
                 if (stopAfterStart) {
@@ -3371,31 +3398,37 @@ void MainWindow::updateGoLiveButton() {
             goLiveMenuAction_->setText("Stop");
             goLiveMenuAction_->setEnabled(true);
         }
-    } else {
-        const bool sourceSelected = !selectedWindowId_.isEmpty();
-        goLiveButton_->setText(sourceSelected ? "GO LIVE" : "SELECT A SOURCE");
-        goLiveButton_->setAccessibleName(sourceSelected ? "Go live" : "Go live unavailable");
-        goLiveButton_->setAccessibleDescription(
-            sourceSelected
-                ? QStringLiteral("Start streaming the selected source.")
-                : QStringLiteral("Select a video source above before going live."));
-        goLiveButton_->setToolTip(
-            sourceSelected
-                ? QStringLiteral("Start streaming the selected source")
-                : QStringLiteral("Select a video source above before going live"));
-        goLiveButton_->setEnabled(sourceSelected);
+    } else if (selectedWindowId_.isEmpty()) {
+        goLiveButton_->setText("GO LIVE");
+        goLiveButton_->setAccessibleName("Go live");
+        goLiveButton_->setAccessibleDescription("Start streaming placeholder frame until a source is selected.");
+        goLiveButton_->setToolTip("Start streaming placeholder frame");
+        goLiveButton_->setEnabled(true);
         goLiveButton_->setStyleSheet(QString());
         if (goLiveAction_) {
             goLiveAction_->setText("Go Live");
-            goLiveAction_->setEnabled(sourceSelected);
+            goLiveAction_->setEnabled(true);
         }
         if (goLiveMenuAction_) {
             goLiveMenuAction_->setText("Go Live");
-            goLiveMenuAction_->setEnabled(sourceSelected);
-            goLiveMenuAction_->setStatusTip(
-                sourceSelected
-                    ? QStringLiteral("Start streaming the selected source")
-                    : QStringLiteral("Select a source before going live"));
+            goLiveMenuAction_->setEnabled(true);
+            goLiveMenuAction_->setStatusTip("Start streaming placeholder frame");
+        }
+    } else {
+        goLiveButton_->setText("GO LIVE");
+        goLiveButton_->setAccessibleName("Go live");
+        goLiveButton_->setAccessibleDescription("Start streaming the selected source.");
+        goLiveButton_->setToolTip("Start streaming the selected source");
+        goLiveButton_->setEnabled(true);
+        goLiveButton_->setStyleSheet(QString());
+        if (goLiveAction_) {
+            goLiveAction_->setText("Go Live");
+            goLiveAction_->setEnabled(true);
+        }
+        if (goLiveMenuAction_) {
+            goLiveMenuAction_->setText("Go Live");
+            goLiveMenuAction_->setEnabled(true);
+            goLiveMenuAction_->setStatusTip("Start streaming the selected source");
         }
     }
 }
@@ -4052,11 +4085,12 @@ void MainWindow::setConfigControlsEnabled(bool enabled) {
         resetDefaultsAction_->setEnabled(enabled && runtimeOptions_.persistedSettingsEnabled);
     }
 
+    const bool sourceSelectEnabled = enabled || (isLive_ && !startInProgress_ && !stopInProgress_);
     if (windowListWidget_) {
-        windowListWidget_->setEnabled(enabled);
+        windowListWidget_->setEnabled(sourceSelectEnabled);
     }
     if (sourceModeSelect_) {
-        sourceModeSelect_->setEnabled(enabled);
+        sourceModeSelect_->setEnabled(sourceSelectEnabled);
     }
     if (cameraResolutionSelect_) {
         cameraResolutionSelect_->setEnabled(enabled);
@@ -4179,6 +4213,16 @@ void MainWindow::refreshSelectedWindowPreview() {
 
     const QString sourceMode = sourceModeSelect_ ? sourceModeSelect_->currentData().toString() : QString("window");
     if (selectedWindowId_.isEmpty()) {
+        if (isLive_ && core_) {
+            const auto frame = core_->getPublisherPreviewFrame();
+            if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
+                QImage img(frame->data.data(), frame->width, frame->height, frame->stride, QImage::Format_ARGB32);
+                QSize targetSize = previewLabel_->size();
+                if (!targetSize.isValid() || targetSize.isEmpty()) targetSize = QSize(420, 220);
+                previewLabel_->setPixmap(QPixmap::fromImage(img).scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                return;
+            }
+        }
         previewLabel_->setPixmap(QPixmap());
         previewLabel_->setText(
             sourceMode == "spout"

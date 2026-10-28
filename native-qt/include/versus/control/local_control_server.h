@@ -30,6 +30,7 @@ class LocalControlServer : public QObject {
     using StopCallback = std::function<void()>;
     using QuitCallback = std::function<void()>;
     using RefreshPeerTransportsCallback = std::function<int()>;
+    using SwitchSourceCallback = std::function<bool(const std::string &mode, const std::string &sourceId)>;
 
     explicit LocalControlServer(QObject *parent = nullptr);
     ~LocalControlServer() override;
@@ -50,6 +51,7 @@ class LocalControlServer : public QObject {
     void setStopCallback(StopCallback callback);
     void setQuitCallback(QuitCallback callback);
     void setRefreshPeerTransportsCallback(RefreshPeerTransportsCallback callback);
+    void setSwitchSourceCallback(SwitchSourceCallback callback);
 
     static QString defaultDiscoveryPath();
     static QString defaultReportDir();
@@ -87,6 +89,7 @@ class LocalControlServer : public QObject {
     StopCallback stopCallback_;
     QuitCallback quitCallback_;
     RefreshPeerTransportsCallback refreshPeerTransportsCallback_;
+    SwitchSourceCallback switchSourceCallback_;
     QHash<QTcpSocket*, QByteArray> buffers_;
     bool discoveryFileWritten_ = false;
     QByteArray discoveryFileContents_;

@@ -146,6 +146,7 @@ struct StartOptions {
     std::string password;
     std::string label;
     std::string streamId;
+    std::string streamTarget;
     std::string server = "wss://wss.vdo.ninja:443";
     std::string salt = "vdo.ninja";
     int maxViewers = 10;
@@ -175,6 +176,11 @@ class VersusApp {
     void stopCapture();
     void setSelectedWindow(const std::string &windowId);
     void setVideoSourceMode(VideoSourceMode mode);
+    bool switchCaptureSource(VideoSourceMode mode, const std::string &sourceId);
+    bool isSourceCapturing() const;
+    void setStreamTarget(const std::string &target);
+    std::string getStreamTarget() const;
+    std::shared_ptr<const versus::video::CapturedFrame> getPlaceholderFrame(int width = 0, int height = 0);
 
     bool goLive(const StartOptions &options);
     void stopLive();
@@ -889,6 +895,13 @@ class VersusApp {
     versus::audio::OpusEncoder opusEncoder_;
     versus::audio::PcmEncoder pcmEncoder_;
     versus::signaling::VdoSignaling signaling_;
+
+    mutable std::mutex placeholderMutex_;
+    std::string streamTarget_;
+    std::shared_ptr<const versus::video::CapturedFrame> cachedPlaceholderFrame_;
+    int cachedPlaceholderWidth_ = 0;
+    int cachedPlaceholderHeight_ = 0;
+    std::string cachedPlaceholderTarget_;
 };
 
 }  // namespace versus::app

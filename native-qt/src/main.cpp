@@ -1,4 +1,4 @@
-﻿#include <QApplication>
+#include <QApplication>
 #include <QIcon>
 #include <QScreen>
 #include <QJsonArray>
@@ -225,6 +225,7 @@ int main(int argc, char *argv[]) {
     bool includeMicrophone = false;
     std::string microphoneDeviceId;
     std::string diagnosticsOutArg;
+    std::string dumpPlaceholderArg;
     bool localControlEnabled = false;
     int localControlPort = 0;
     bool localControlPortSpecified = false;
@@ -428,6 +429,11 @@ int main(int argc, char *argv[]) {
             includeMicrophone = true;
         } else if (arg.find("--diagnostics-out=") == 0) {
             diagnosticsOutArg = arg.substr(18);
+        } else if (arg.find("--dump-placeholder=") == 0) {
+            dumpPlaceholderArg = arg.substr(19);
+            if (dumpPlaceholderArg.size() >= 2 && dumpPlaceholderArg.front() == '"' && dumpPlaceholderArg.back() == '"') {
+                dumpPlaceholderArg = dumpPlaceholderArg.substr(1, dumpPlaceholderArg.size() - 2);
+            }
         } else if (arg == "--alpha-workflow") {
             alphaWorkflowEnabled = true;
         } else if (arg.find("--alpha-background=") == 0) {
@@ -582,6 +588,21 @@ int main(int argc, char *argv[]) {
     auto coreHolder = std::make_unique<versus::app::VersusApp>();
     auto &core = *coreHolder;
     core.initialize();
+
+    if (!dumpPlaceholderArg.empty()) {
+        core.setStreamTarget(streamId);
+        auto frame = core.getPlaceholderFrame(width, height);
+        if (frame && !frame->data.empty()) {
+            QImage img(reinterpret_cast<const uchar *>(frame->data.data()),
+                       frame->width, frame->height, frame->stride,
+                       QImage::Format_ARGB32);
+            bool ok = img.save(QString::fromStdString(dumpPlaceholderArg));
+            core.shutdown();
+            return ok ? 0 : 1;
+        }
+        core.shutdown();
+        return 1;
+    }
     auto writeDiagnostics = [&core, &diagnosticsOutArg](const char *reason) {
         if (diagnosticsOutArg.empty()) {
             return;
@@ -652,6 +673,15 @@ int main(int argc, char *argv[]) {
         });
         localControlServer->setRefreshPeerTransportsCallback([&core]() {
             return core.refreshPeerTransportsForLocalControl();
+        });
+        localControlServer->setSwitchSourceCallback([&core](const std::string &mode, const std::string &sourceId) {
+            auto sourceMode = versus::app::VideoSourceMode::Window;
+            if (mode == "camera") {
+                sourceMode = versus::app::VideoSourceMode::Camera;
+            } else if (mode == "spout") {
+                sourceMode = versus::app::VideoSourceMode::Spout;
+            }
+            return core.switchCaptureSource(sourceMode, sourceId);
         });
 
         versus::control::LocalControlServerConfig controlConfig;
@@ -849,6 +879,7 @@ int main(int argc, char *argv[]) {
         options.output = outputConfig;
         options.server = server;
         options.streamId = streamId;
+        options.streamTarget = streamId;
         options.password = password;
         options.room = room;
         options.label = label;

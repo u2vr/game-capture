@@ -296,6 +296,10 @@ void LocalControlServer::setRefreshPeerTransportsCallback(RefreshPeerTransportsC
     refreshPeerTransportsCallback_ = std::move(callback);
 }
 
+void LocalControlServer::setSwitchSourceCallback(SwitchSourceCallback callback) {
+    switchSourceCallback_ = std::move(callback);
+}
+
 QString LocalControlServer::defaultDiscoveryPath() {
     return appDataPath("control.json");
 }
@@ -545,6 +549,23 @@ void LocalControlServer::routeRequest(QTcpSocket *socket, const HttpRequest &req
             const QJsonDocument responseDoc = jsonDocumentFromBytes(response);
             const bool created = responseDoc.isObject() && responseDoc.object().value("ok").toBool();
             sendJson(socket, created ? 201 : 500, response);
+            return;
+        }
+        if (command == "switch_source") {
+            if (!switchSourceCallback_) {
+                sendError(socket, 500, "Switch source callback unavailable");
+                return;
+            }
+            const std::string mode = body.value("mode").toString().toStdString();
+            const std::string sourceId = body.value("source_id").toString().toStdString();
+            const bool switched = switchSourceCallback_(mode, sourceId);
+            QJsonObject response{
+                {"ok", switched},
+                {"command", command},
+                {"mode", QString::fromStdString(mode)},
+                {"source_id", QString::fromStdString(sourceId)}
+            };
+            sendJson(socket, switched ? 200 : 400, QJsonDocument(response).toJson(QJsonDocument::Compact));
             return;
         }
         sendError(socket, 400, "Unknown command");
